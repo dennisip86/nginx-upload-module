@@ -339,6 +339,8 @@ static ngx_path_init_t        ngx_http_upload_temp_path = {
 };
 #endif
 
+static ngx_int_t ngx_http_read_upload_client_request_chunked_body(ngx_http_request_t *r);
+
 /*
  * upload_init_ctx
  *
@@ -777,7 +779,7 @@ ngx_http_upload_handler(ngx_http_request_t *r)
     if(r->method & NGX_HTTP_OPTIONS)
         return ngx_http_upload_options_handler(r);
 
-    if (!(r->method & NGX_HTTP_POST))
+    if (!(r->method & NGX_HTTP_POST) && !(r->method & NGX_HTTP_PUT))
         return NGX_HTTP_NOT_ALLOWED;
 
     ulcf = ngx_http_get_module_loc_conf(r, ngx_http_upload_module);
@@ -3110,6 +3112,18 @@ ngx_http_read_upload_client_request_body(ngx_http_request_t *r) {
 
     r->request_body = rb;
 
+    if (r->headers_in.chunked) {
+        /* r->headers_in.content_length is empty if not exist Content-type header */
+        if (NULL == r->headers_in.content_length) {
+            r->headers_in.content_length = ngx_palloc(r->pool, sizeof(ngx_table_elt_t));
+            if (NULL == r->headers_in.content_length) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+        }
+
+        return ngx_http_read_upload_client_request_chunked_body(r);
+    }
+
     if (r->headers_in.content_length_n <= 0) {
         upload_shutdown_ctx(u);
         return NGX_HTTP_BAD_REQUEST;
@@ -4282,4 +4296,432 @@ ngx_http_upload_test_expect(ngx_http_request_t *r)
     /* we assume that such small packet should be send successfully */
 
     return NGX_ERROR;
+} /* }}} */
+
+// ============================================================================
+// All my change below here.
+// Have fun!! :)
+// ============================================================================
+int preread_from_header(ngx_buf_t *header, u_char *buf, int len)
+{
+    memcpy(buf, header->pos, len);
+    return len;
+}
+
+int char2number(char ch) {
+    if (ch >= '0' && ch <= '9'){
+        return ch - '0';
+    }
+
+    int lower_ch = ch | 0x20;
+    if (lower_ch >= 'a' && lower_ch <= 'f') {
+        return lower_ch - 'a' + 10;
+    }
+
+    return -1;
+}
+
+// Recv each chunked body
+// use rb->headers_in.content_length_n to save chunked status.
+// rb->headers_in.content_length_n will recalculate while process request that we do need to set here.
+static ngx_int_t /* {{{ ngx_http_do_read_upload_client_request_body */
+ngx_http_do_read_upload_client_request_chunked_body(ngx_http_request_t *r)
+{
+    ssize_t                     size, n, limit;
+    ngx_connection_t          *c;
+    ngx_http_request_body_t   *rb;
+    ngx_http_upload_ctx_t     *u = ngx_http_get_module_ctx(r, ngx_http_upload_module);
+    ngx_int_t                  rc;
+    ngx_http_core_loc_conf_t  *clcf;
+    ngx_msec_t                 delay;
+
+    c = r->connection;
+    rb = r->request_body;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "http read client request body");
+
+    int preread;
+    enum ChunkedState {
+        cs_chunked_size = 0,
+        cs_chunked_size_want_lf,
+        cs_chunked_body,
+        cs_chunked_body_want_cr,
+        cs_chunked_body_want_lf,
+        cs_chunked_end_want_cr,
+        cs_chunked_end_want_lf,
+        cs_chunked_end
+    };
+    // Use r->headers_in.content_length_n as the chunked_status
+#define chunked_status r->headers_in.content_length_n
+#define HTTP_CHUNKED_CR '\r'
+#define HTTP_CHUNKED_LF '\n'
+
+    u_char rcbuf_memory;
+    u_char *ch = &rcbuf_memory;
+
+    preread = r->header_in->last - r->header_in->pos;
+
+    for ( ;; ) {
+        for ( ;; ) {
+            if (rb->buf->last == rb->buf->end) {
+
+                rc = ngx_http_process_request_body(r, u->to_write);
+
+                switch(rc) {
+                    case NGX_OK:
+                        break;
+                    case NGX_UPLOAD_MALFORMED:
+                        return NGX_HTTP_BAD_REQUEST;
+                    case NGX_UPLOAD_TOOLARGE:
+                        return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+                    case NGX_UPLOAD_IOERROR:
+                        return NGX_HTTP_SERVICE_UNAVAILABLE;
+                    case NGX_UPLOAD_NOMEM: case NGX_UPLOAD_SCRIPTERROR:
+                    default:
+                        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+
+                u->to_write = rb->bufs->next ? rb->bufs->next : rb->bufs;
+                rb->buf->last = rb->buf->start;
+            }
+
+            if (cs_chunked_body == chunked_status) {
+
+                ngx_log_error(NGX_LOG_ERR, c->log, 0, "cs_chunked_body");
+
+                size = rb->buf->end - rb->buf->last;
+
+                if ((off_t)size > rb->rest) {
+                    size = (size_t)rb->rest;
+                }
+
+                if (u->limit_rate) {
+                    limit = u->limit_rate * (ngx_time() - r->start_sec + 1) - u->received;
+
+                    if (limit < 0) {
+                        c->read->delayed = 1;
+                        ngx_add_timer(c->read,
+                                      (ngx_msec_t) (- limit * 1000 / u->limit_rate + 1));
+
+                        return NGX_AGAIN;
+                    }
+
+                    if(limit > 0 && size > limit) {
+                        size = limit;
+                    }
+                }
+
+                if (preread > 0) {
+                    if (preread < size) {
+                        size = preread;
+                    }
+
+                    n = preread_from_header(r->header_in, rb->buf->last, size);
+                    r->header_in->pos += n;
+                    preread -= n;
+
+                    rb->buf->last += n;
+                    rb->rest -= n;
+                    r->request_length += n;
+                    u->received += n;
+
+                    if (rb->rest == 0) {
+                        chunked_status = cs_chunked_body_want_cr;
+                        break;
+                    }
+                } else {
+                    n = c->recv(c, rb->buf->last, size);
+
+                    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                                   "http client request body recv %z", n);
+
+                    if (n == NGX_AGAIN) {
+                        break;
+                    }
+
+                    if (n == 0) {
+                        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                                      "client closed prematurely connection");
+                    }
+
+                    if (n == 0 || n == NGX_ERROR) {
+                        c->error = 1;
+                        return NGX_HTTP_BAD_REQUEST;
+                    }
+
+                    rb->buf->last += n;
+                    rb->rest -= n;
+                    r->request_length += n;
+                    u->received += n;
+
+                    if (rb->rest == 0) {
+                        chunked_status = cs_chunked_body_want_cr;
+                        break;
+                    }
+
+                    // It mean data doesn't arrive at this time, we may wait if not ready.
+                    if (rb->buf->last < rb->buf->end) {
+                        break;
+                    }
+                }
+
+                if (u->limit_rate) {
+                    delay = (ngx_msec_t) (n * 1000 / u->limit_rate + 1);
+
+                    if (delay > 0) {
+                        c->read->delayed = 1;
+                        ngx_add_timer(c->read, delay);
+                        return NGX_AGAIN;
+                    }
+                }
+
+                continue;
+            }
+
+            // Recv 1 byte per loop.
+            if (preread > 0) {
+                n = preread_from_header(r->header_in, ch, 1);
+                r->header_in->pos += n;
+                preread -= n;
+            } else {
+                n = c->recv(c, ch, 1);
+
+                if (n == NGX_AGAIN) {
+                    break;
+                }
+
+                if (n == 0) {
+                    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                            "client closed prematurely connection");
+                }
+
+                if (n == 0 || n == NGX_ERROR) {
+                    c->error = 1;
+                    return NGX_HTTP_BAD_REQUEST;
+                }
+            }
+
+            switch (chunked_status) {
+            case cs_chunked_size:
+                ngx_log_error(NGX_LOG_ERR, c->log, 0, "cs_chunked_size: %d,%c", (int)rb->rest, *ch);
+                if (HTTP_CHUNKED_CR == *ch) {
+                    chunked_status = cs_chunked_size_want_lf;
+                    break;
+                }
+
+                int num = char2number(*ch);
+                if (num < 0) {
+                    return NGX_HTTP_BAD_REQUEST;
+                }
+
+                if (0 == rb->rest && 0 == num) {
+                    chunked_status = cs_chunked_end_want_cr;
+                    break;
+                }
+
+                rb->rest = (rb->rest << 4) + num;
+                break;
+
+            case cs_chunked_size_want_lf:
+                ngx_log_error(NGX_LOG_ERR, c->log, 0, "cs_chunked_size_want_lf");
+                if (HTTP_CHUNKED_LF == *ch) {
+                    chunked_status = cs_chunked_body;
+                } else {
+                    return NGX_HTTP_BAD_REQUEST;
+                }
+                break;
+
+            case cs_chunked_body_want_cr:
+                ngx_log_error(NGX_LOG_ERR, c->log, 0, "cs_chunked_body_want_cr");
+                if (HTTP_CHUNKED_CR == *ch) {
+                    chunked_status = cs_chunked_body_want_lf;
+                } else {
+                    return NGX_HTTP_BAD_REQUEST;
+                }
+                break;
+
+            case cs_chunked_body_want_lf:
+                ngx_log_error(NGX_LOG_ERR, c->log, 0, "cs_chunked_body_want_lf");
+                if (HTTP_CHUNKED_LF == *ch) {
+                    chunked_status = cs_chunked_size;
+                } else {
+                    return NGX_HTTP_BAD_REQUEST;
+                }
+                break;
+
+            case cs_chunked_end_want_cr:
+                ngx_log_error(NGX_LOG_ERR, c->log, 0, "cs_chunked_end_want_cr");
+                if (HTTP_CHUNKED_CR == *ch) {
+                    chunked_status = cs_chunked_end_want_lf;
+                } else {
+                    return NGX_HTTP_BAD_REQUEST;
+                }
+                break;
+
+            case cs_chunked_end_want_lf:
+                ngx_log_error(NGX_LOG_ERR, c->log, 0, "cs_chunked_end_want_lf");
+                if (HTTP_CHUNKED_LF == *ch) {
+                    chunked_status = cs_chunked_end;
+                } else {
+                    return NGX_HTTP_BAD_REQUEST;
+                }
+                break;
+
+            default:
+                ngx_log_error(NGX_LOG_ERR, c->log, 0, "default");
+                return NGX_HTTP_BAD_REQUEST;
+            }
+
+
+            if (cs_chunked_end == chunked_status) {
+                break;
+            }
+        }
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                       "http client request body rest %uz", rb->rest);
+
+        if (cs_chunked_end == chunked_status) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0, "cs_chunked_end");
+            break;
+        }
+
+        if (!c->read->ready) {
+            clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+            ngx_add_timer(c->read, clcf->client_body_timeout);
+
+            if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            return NGX_AGAIN;
+        }
+    }
+
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+
+    rc = ngx_http_process_request_body(r, u->to_write);
+
+    switch(rc) {
+        case NGX_OK:
+            break;
+        case NGX_UPLOAD_MALFORMED:
+            return NGX_HTTP_BAD_REQUEST;
+        case NGX_UPLOAD_TOOLARGE:
+            return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+        case NGX_UPLOAD_IOERROR:
+            return NGX_HTTP_SERVICE_UNAVAILABLE;
+        case NGX_UPLOAD_NOMEM: case NGX_UPLOAD_SCRIPTERROR:
+        default:
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    upload_shutdown_ctx(u);
+
+    return ngx_http_upload_body_handler(r);
+} /* }}} */
+
+/* Copy from the origin handler function */
+static void /* {{{ ngx_http_read_upload_client_request_body_handler */
+ngx_http_read_upload_client_request_chunked_body_handler(ngx_http_request_t *r)
+{
+    ngx_int_t  rc;
+    ngx_http_upload_ctx_t     *u = ngx_http_get_module_ctx(r, ngx_http_upload_module);
+    ngx_event_t               *rev = r->connection->read;
+    ngx_http_core_loc_conf_t  *clcf;
+
+    if (rev->timedout) {
+        if(!rev->delayed) {
+            r->connection->timedout = 1;
+            upload_shutdown_ctx(u);
+            ngx_http_finalize_request(r, NGX_HTTP_REQUEST_TIME_OUT);
+            return;
+        }
+
+        rev->timedout = 0;
+        rev->delayed = 0;
+
+        if (!rev->ready) {
+            clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+            ngx_add_timer(rev, clcf->client_body_timeout);
+
+            if (ngx_handle_read_event(rev, clcf->send_lowat) != NGX_OK) {
+                upload_shutdown_ctx(u);
+                ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            }
+
+            return;
+        }
+    }
+    else{
+        if (r->connection->read->delayed) {
+            clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, rev->log, 0,
+                           "http read delayed");
+
+            if (ngx_handle_read_event(rev, clcf->send_lowat) != NGX_OK) {
+                upload_shutdown_ctx(u);
+                ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            }
+
+            return;
+        }
+    }
+
+    rc = ngx_http_do_read_upload_client_request_chunked_body(r);
+
+    if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+        upload_shutdown_ctx(u);
+        ngx_http_finalize_request(r, rc);
+    }
+} /* }}} */
+
+static ngx_int_t /* {{{ ngx_http_read_upload_client_request_chunked_body */
+ngx_http_read_upload_client_request_chunked_body(ngx_http_request_t *r)
+{
+    ssize_t size;
+    ngx_chain_t *cl, **next;
+    ngx_http_request_body_t *rb;
+    ngx_http_core_loc_conf_t *clcf;
+    ngx_http_upload_ctx_t *u = ngx_http_get_module_ctx(r, ngx_http_upload_module);
+
+    rb = r->request_body;
+
+    // Init the chunked status at the begining.
+    r->headers_in.content_length_n = 0;
+    rb->rest = 0;
+
+    next = &rb->bufs;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    // always use body buffer size
+    size = clcf->client_body_buffer_size;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, r->connection->log, 0, "Mine: dbg[%d][size: %d].", __LINE__, size);
+
+    rb->buf = ngx_create_temp_buf(r->pool, size);
+    if (rb->buf == NULL) {
+        upload_shutdown_ctx(u);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    cl = ngx_alloc_chain_link(r->pool);
+    if (cl == NULL) {
+        upload_shutdown_ctx(u);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    cl->buf = rb->buf;
+    cl->next = NULL;
+
+    *next = cl;
+
+    u->to_write = rb->bufs;
+
+    r->read_event_handler = ngx_http_read_upload_client_request_chunked_body_handler;
+
+    return ngx_http_do_read_upload_client_request_chunked_body(r);
 } /* }}} */
