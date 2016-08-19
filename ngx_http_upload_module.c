@@ -8,6 +8,9 @@
 #include <ngx_http.h>
 #include <nginx.h>
 
+#include <uuid/uuid.h>
+#define UUID_STR_LENGTH 36
+
 #if (NGX_HAVE_OPENSSL_MD5_H)
 #include <openssl/md5.h>
 #else
@@ -1206,7 +1209,6 @@ static ngx_int_t ngx_http_upload_start_handler(ngx_http_upload_ctx_t *u) { /* {{
     ngx_file_t  *file = &u->output_file;
     ngx_path_t  *path = u->store_path;
     ngx_path_t  *state_path = u->state_store_path;
-    uint32_t    n;
     ngx_uint_t  i;
     ngx_int_t   rc;
     ngx_err_t   err;
@@ -1216,6 +1218,12 @@ static ngx_int_t ngx_http_upload_start_handler(ngx_http_upload_ctx_t *u) { /* {{
     ngx_uint_t  pass_field;
     ngx_upload_cleanup_t  *ucln;
 
+    uuid_t uuid;
+    u_char uuid_str[UUID_STR_LENGTH + 1];
+    ngx_str_t unique_filename;
+    unique_filename.len = UUID_STR_LENGTH;
+    unique_filename.data = uuid_str;
+
     if(u->is_file) {
         u->ordinal++;
 
@@ -1224,7 +1232,7 @@ static ngx_int_t ngx_http_upload_start_handler(ngx_http_upload_ctx_t *u) { /* {{
         if(u->cln == NULL)
             return NGX_UPLOAD_NOMEM;
 
-        file->name.len = path->name.len + 1 + path->len + (u->session_id.len != 0 ? u->session_id.len : 10);
+        file->name.len = path->name.len + 1 + path->len + UUID_STR_LENGTH + u->session_id.len;
 
         file->name.data = ngx_palloc(u->request->pool, file->name.len + 1);
 
@@ -1235,9 +1243,12 @@ static ngx_int_t ngx_http_upload_start_handler(ngx_http_upload_ctx_t *u) { /* {{
 
         file->log = r->connection->log;
 
+        uuid_generate(uuid);
+        uuid_unparse(uuid, (char *)unique_filename.data);
+
         if(u->session_id.len != 0) {
             (void) ngx_sprintf(file->name.data + path->name.len + 1 + path->len,
-                               "%V%Z", &u->session_id);
+                               "%V-%V%Z", &unique_filename, &u->session_id);
 
             ngx_create_hashed_filename(path, file->name.data, file->name.len);
 
@@ -1253,7 +1264,7 @@ static ngx_int_t ngx_http_upload_start_handler(ngx_http_upload_ctx_t *u) { /* {{
                         return NGX_UPLOAD_NOMEM;
                 }
 
-                state_file->name.len = state_path->name.len + 1 + state_path->len + u->session_id.len + sizeof(".state")-1;
+                state_file->name.len = state_path->name.len + 1 + state_path->len + UUID_STR_LENGTH + u->session_id.len + sizeof(".state")-1;
                 state_file->name.data = ngx_palloc(u->request->pool, state_file->name.len + 1);
 
                 if(state_file->name.data == NULL)
@@ -1261,7 +1272,7 @@ static ngx_int_t ngx_http_upload_start_handler(ngx_http_upload_ctx_t *u) { /* {{
 
                 ngx_memcpy(state_file->name.data, state_path->name.data, state_path->name.len);
                 (void) ngx_sprintf(state_file->name.data + state_path->name.len + 1 + state_path->len,
-                        "%V.state%Z", &u->session_id);
+                        "%V-%V.state%Z", &unique_filename, &u->session_id);
 
                 ngx_create_hashed_filename(state_path, state_file->name.data, state_file->name.len);
 
@@ -1283,10 +1294,8 @@ static ngx_int_t ngx_http_upload_start_handler(ngx_http_upload_ctx_t *u) { /* {{
         }
         else{
             for(;;) {
-                n = (uint32_t) ngx_next_temp_number(0);
-
                 (void) ngx_sprintf(file->name.data + path->name.len + 1 + path->len,
-                                   "%010uD%Z", n);
+                                   "%V%Z", &unique_filename);
 
                 ngx_create_hashed_filename(path, file->name.data, file->name.len);
 
@@ -1303,7 +1312,6 @@ static ngx_int_t ngx_http_upload_start_handler(ngx_http_upload_ctx_t *u) { /* {{
                 err = ngx_errno;
 
                 if (err == NGX_EEXIST) {
-                    n = (uint32_t) ngx_next_temp_number(1);
                     continue;
                 }
 
